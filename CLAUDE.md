@@ -58,15 +58,21 @@ preprocess_inputs   ──┤
 
 ## Output naming convention
 
-The network name (and output folder) is constructed automatically from active flags and targets:
+The network name (and output folder) uses a compact format to stay within
+Windows' 260-character path limit (inspired by PyPSA-EUR):
 
 ```
-{B_}{H_}{RE_}{H2_}{MEOH_}{METH_}{SN_}{ST_}CO2_{co2}_{tD|tP}_H2_{h2}_MeOH_{meoh}_CH4_{ch4}_{year}_El_{el}_{DET|STC}[_TR_{res}]_{run_name}
+{run_name}_{year}_{det|stc}_{res}
 ```
 
-`_TR_{res}` (e.g. `_TR_4h`) is appended only when `clustering.temporal.resolution` is set.
+Examples: `tut1_price_2024_det_3h`, `tut4_stoch_2024_stc_3h`
 
-`build_network_name()` in `Snakefile` and `file_name_network()` in `scripts/helpers.py` both produce this string (one for Snakemake path resolution before any rule runs, one for the standalone script after the network is built).
+Rolling horizon runs append `_RH`: `tut2_brownfield_2024_det_3h_RH`
+
+The full configuration (flags, CO2 cost, targets, …) is stored inside the
+network `.nc` file — nothing is lost by keeping the folder name short.
+
+`build_network_name()` in `Snakefile` and `file_name_network()` in `scripts/helpers.py` both produce this string.
 
 ## Key script responsibilities
 
