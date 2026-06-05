@@ -52,27 +52,26 @@ preprocess_inputs   ──┤
                        ├─► prepare_inputs ─► build_network ─► solve_network ─► plot_results
 ```
 
-- Intermediate files land in `resources/` and `data/Inputs_{year}/` (both gitignored).
-- Final outputs go to `outputs/single_analysis/{network_name}/plots/` and `/networks/`.
+- Intermediate files land in `resources/{run_name}/` and `data/Inputs_{year}/` (both gitignored).
+- Final outputs go to `outputs/single_analysis/{run_name}/plots/` and `/networks/`.
 - The `onstart` hook in `Snakefile` checks the remote SHA of the technology-data CSV and auto-invalidates the local copy if it has changed.
 
 ## Output naming convention
 
-The network name (and output folder) uses a compact format to stay within
-Windows' 260-character path limit (inspired by PyPSA-EUR):
+A hybrid naming scheme separates the **folder** from the **file names** to
+stay within Windows' 260-character path limit:
 
-```
-{run_name}_{year}_{det|stc}_{res}
-```
+- **Output folder**: `outputs/single_analysis/{run_name}/` — short, just the run name.
+- **File names** inside that folder (`.nc`, `.svg`, `.dot`, duals, pkl):
+  `{flag_prefix}CO2_{co2}_{tD|tP}_H2_{h2}_MeOH_{meoh}_CH4_{ch4}_{year}_El_{el}_{DET|STC}_{res}_{run_name}`
 
-Examples: `tut1_price_2024_det_3h`, `tut4_stoch_2024_stc_3h`
+Examples:
+- folder `tut1_price/`, file `B_H_RE_H2_MEOH_METH_SN_ST_CO2_100_tP_H2_120_MeOH_200_CH4_200_2024_El_0.1_DET_8h_tut1_price_OPT.nc`
+- Rolling horizon appends `_RH` to the file name prefix.
 
-Rolling horizon runs append `_RH`: `tut2_brownfield_2024_det_3h_RH`
+Multiple configurations sharing the same `run_name` (different years, modes, flags) coexist in the same folder — the descriptive file names distinguish them.
 
-The full configuration (flags, CO2 cost, targets, …) is stored inside the
-network `.nc` file — nothing is lost by keeping the folder name short.
-
-`build_network_name()` in `Snakefile` and `file_name_network()` in `scripts/helpers.py` both produce this string.
+`build_network_name()` in `Snakefile` and `file_name_network()` in `scripts/helpers.py` both produce the long file-name string.
 
 ## Key script responsibilities
 
