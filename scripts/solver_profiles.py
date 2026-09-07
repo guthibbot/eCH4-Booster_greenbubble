@@ -44,7 +44,7 @@ GUROBI_PROFILES = {
         "Threads": _default_threads(8),
         "Method": 2,                 # barrier
         "Crossover": 0,              # no crossover
-        "BarConvTol": 1e-5,
+        "BarConvTol": 1e-8,
         "Seed": 123,
         "AggFill": 0,
         "PreDual": 0,

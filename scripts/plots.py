@@ -1411,7 +1411,7 @@ def _find_product_slot(links, lk, collection_buses):
     return None
 
 
-def compute_lcop_by_technology(n, out_csv, out_plot):
+def compute_lcop_by_technology(n, out_csv, out_plot, capacity_th=0.0):
     """Compute LCOP, revenue, and annual profit for each technology injecting
     into a product collection bus (tagged is_product_bus=True).
 
@@ -1511,6 +1511,10 @@ def compute_lcop_by_technology(n, out_csv, out_plot):
     rows = []
     link_names = []
     for lk in product_links:
+        p_nom_opt = _capacity_opt(links.loc[lk], "p_nom")
+        if p_nom_opt is None or p_nom_opt < capacity_th:
+            continue
+
         capex = _get_stat(capex_s, lk)
         opex  = _get_stat(opex_s,  lk)
 
@@ -3176,7 +3180,7 @@ def shadow_prices_violinplot_stoch(
     mean_color="crimson",
     mean_linewidth=2.0,
     title="Shadow prices (violin w/ mean) – scenario weighted",
-    fname="shd_prices_violin.png",
+    fname="shd_prices_violin.pdf",
 ):
 
     rng = np.random.default_rng(seed)
@@ -3359,7 +3363,7 @@ def shadow_prices_ldc_stoch(
     floor_zero=False,
     n_points=1001,
     title="Shadow prices (duration curves)",
-    fname="shd_prices_ldc__subplots.png",
+    fname="shd_prices_ldc__subplots.pdf",
     lw=1.8,
     ncols=2,                         # subplot layout
     sharey=True,
@@ -6396,7 +6400,7 @@ def run_plot_and_export(
         )
         plot_total_system_cost_stacked(
             summary,
-            outpath=str(plot_folder / "TSC_by_carrier.png"),
+            outpath=str(plot_folder / "TSC_by_carrier.pdf"),
             title="Total system cost by carrier (stacked)",
             which="total",
             add_expected=True,
@@ -6412,7 +6416,7 @@ def run_plot_and_export(
         )
         plot_total_system_cost_stacked(
             summary_agents,
-            outpath=str(plot_folder / "TSC_by_agents.png"),
+            outpath=str(plot_folder / "TSC_by_agents.pdf"),
             title="Total system cost by agents (stacked)",
             which="total",
             add_expected=True,
@@ -6464,23 +6468,24 @@ def run_plot_and_export(
 
         plot_capacity_compare_from_items(
             df_caps,
-            outpath=str(plot_folder / "Opt_capacities_SP_vs_WS.png"),
+            outpath=str(plot_folder / "Opt_capacities_SP_vs_WS.pdf"),
             title="Installed capacities (SP vs WS)",
         )
 
     def step_inputs_ldc() -> None:
         plot_ldc_inputs_by_scenario(
             n,
-            outpath=str(plot_folder / "inputs_LDC_by_scenario.png"),
+            outpath=str(plot_folder / "inputs_LDC_by_scenario.pdf"),
             ncols=3,
             price_links=[
                 {"label": "El pruchase price", "selector": {"contains": "DK1_to_El_"}, "ls": "-", "lw": 1.8},
-                {"label": "El selling price", "name": "El3 bus_to_DK1", "ls": "-", "lw": 1.8},
+                {"label": "El selling price", "selector": "El3 bus_to_DK1", "ls": "-", "lw": 1.8},
                 {"label": "NG price", "selector": {"regex": r"_NG boiler$"}, "ls": "-", "lw": 1.8},
-                {"label": "NG selling price", "name": "CH4_to_delivery", "ls": "-", "lw": 1.8},
-                {"label": "DH selling price", "name": "DH_GL_to_DH_grid", "ls": "-", "lw": 1.8},
-                {"label": "Biochar selling price", "name": "biochar sequestration", "ls": "-", "lw": 1.8},
-                {"label": "CO2 (L) selling price", "name": "CO2 Liq seq", "ls": "-", "lw": 1.8},
+                {"label": "bioCH4 selling price", "selector": "bioCH4_collection_to_delivery", "ls": "-", "lw": 1.8},
+                {"label": "eCH4 selling price", "selector": "eCH4_collection_to_delivery", "ls": "-", "lw": 1.8},
+                {"label": "DH selling price", "selector": "DH_GL_to_DH_grid", "ls": "-", "lw": 1.8},
+                {"label": "Biochar selling price", "selector": "biochar sequestration", "ls": "-", "lw": 1.8},
+                {"label": "CO2 (L) selling price", "selector": "CO2 Liq seq", "ls": "-", "lw": 1.8},
             ],
             price_gens=[
                 {"label": "Pellets price", "selector": "pellets market", "ls": "-.", "lw": 1.8},
@@ -6503,7 +6508,7 @@ def run_plot_and_export(
         # CSV and bar chart use the same bus list
         e_means, e_throughputs = export_shadow_prices_mean_csv(n, bus_list_bar, csv_folder / "shadow_prices_mean.csv")
         plot_shadow_prices_mean_bar(
-            e_means, plot_folder / "shd_prices_mean_bar.png",
+            e_means, plot_folder / "shd_prices_mean_bar.pdf",
             bus_filter=bus_list_bar,
             throughput=e_throughputs if driver == "price" else None,
         )
@@ -6535,7 +6540,7 @@ def run_plot_and_export(
             handle_spikes="clip",
             quantile_hi=0.98,
             n_points=1001,
-            fname="shd_prices_ldc.png",
+            fname="shd_prices_ldc.pdf",
             title="Shadow prices — load-duration curves over snapshots",
         )
 
@@ -6547,7 +6552,7 @@ def run_plot_and_export(
         plot_utilization_ldc_by_scenario(
             n,
             items=items_f,
-            outpath=plot_folder / "CF_operation_by_scenario.png",
+            outpath=plot_folder / "CF_operation_by_scenario.pdf",
             title="Utilization LDCs by scenario (exact + EXI only)",
             ncols=3,
             carrier_colors=c.carrier_colors,
@@ -6556,7 +6561,7 @@ def run_plot_and_export(
         figure_heatmaps_compare_scenarios(
             n,
             items_f,
-            outpath=plot_folder / "CF_operation_heat_maps_by_scenario.png",
+            outpath=plot_folder / "CF_operation_heat_maps_by_scenario.pdf",
             title="Optimal CF patterns by scenario (normalized 0–1)",
             cmap="viridis",
             abs_links=True,
@@ -6565,7 +6570,7 @@ def run_plot_and_export(
         figure_heatmaps_compare_scenarios_actual(
             n,
             items_f,
-            outpath=plot_folder / "Operation_heat_maps_by_scenario.png",
+            outpath=plot_folder / "Operation_heat_maps_by_scenario.pdf",
             title="Operational heatmaps by scenario (actual values; capacity-normalized colors)",
             cmap_pos="viridis",  # sequential for >=0 series
             cmap_div="coolwarm",  # diverging for signed dispatch
@@ -6595,7 +6600,8 @@ def run_plot_and_export(
         compute_lcop_by_technology(
             n,
             out_csv=csv_folder / "lcop_by_technology.csv",
-            out_plot=plot_folder / "lcop_by_technology.png",
+            out_plot=plot_folder / "lcop_by_technology.pdf",
+            capacity_th=c.capacity_threshold_default,
         )
 
     def step_lcop_kkt() -> None:
@@ -6608,7 +6614,7 @@ def run_plot_and_export(
         compute_srmc_by_technology(
             n,
             out_csv=csv_folder / "srmc_by_technology.csv",
-            out_plot=plot_folder / "srmc_by_technology.png",
+            out_plot=plot_folder / "srmc_by_technology.pdf",
         )
 
     tech_costs_full_holder: Dict[str, Any] = {}
@@ -6643,7 +6649,7 @@ def run_plot_and_export(
             n_config=c.n_config,
             discount_rate=c.discount_rate,
             out_csv=csv_folder / "payback_by_agent.csv",
-            out_plot=plot_folder / "payback_by_agent.png",
+            out_plot=plot_folder / "payback_by_agent.pdf",
             amortization_period=c.amortization_period,
         )
 
@@ -6729,16 +6735,17 @@ def run_plot_operational(
     def step_inputs_ldc() -> None:
         plot_ldc_inputs_by_scenario(
             n,
-            outpath=plot_folder / "inputs_LDC_by_scenario.png",
+            outpath=plot_folder / "inputs_LDC_by_scenario.pdf",
             ncols=3,
             price_links=[
                 {"label": "El purchase price", "selector": {"contains": "DK1_to_El_"}, "ls": "-", "lw": 1.8},
-                {"label": "El selling price",  "name": "El3 bus_to_DK1",               "ls": "-", "lw": 1.8},
+                {"label": "El selling price",  "selector": "El3 bus_to_DK1",               "ls": "-", "lw": 1.8},
                 {"label": "NG price",          "selector": {"regex": r"_NG boiler$"},   "ls": "-", "lw": 1.8},
-                {"label": "NG selling price",  "name": "CH4_to_delivery",            "ls": "-", "lw": 1.8},
-                {"label": "DH selling price",  "name": "DH_GL_to_DH_grid",             "ls": "-", "lw": 1.8},
-                {"label": "Biochar selling price", "name": "biochar sequestration",     "ls": "-", "lw": 1.8},
-                {"label": "CO2 (L) selling price", "name": "CO2 Liq seq",              "ls": "-", "lw": 1.8},
+                {"label": "bioCH4 selling price",  "selector": "bioCH4_collection_to_delivery",            "ls": "-", "lw": 1.8},
+                {"label": "eCH4 selling price", "selector": "eCH4_collection_to_delivery", "ls": "-", "lw": 1.8},
+                {"label": "DH selling price",  "selector": "DH_GL_to_DH_grid",             "ls": "-", "lw": 1.8},
+                {"label": "Biochar selling price", "selector": "biochar sequestration",     "ls": "-", "lw": 1.8},
+                {"label": "CO2 (L) selling price", "selector": "CO2 Liq seq",              "ls": "-", "lw": 1.8},
             ],
             price_gens=[
                 {"label": "Pellets price",  "selector": "pellets market",       "ls": "-.", "lw": 1.8},
@@ -6761,7 +6768,7 @@ def run_plot_operational(
         # CSV and bar chart use the same bus list
         e_means, e_throughputs = export_shadow_prices_mean_csv(n, bus_list_bar, csv_folder / "shadow_prices_mean.csv")
         plot_shadow_prices_mean_bar(
-            e_means, plot_folder / "shd_prices_mean_bar.png",
+            e_means, plot_folder / "shd_prices_mean_bar.pdf",
             bus_filter=bus_list_bar,
             throughput=e_throughputs if driver == "price" else None,
         )
@@ -6792,7 +6799,7 @@ def run_plot_operational(
             handle_spikes="clip",
             quantile_hi=0.98,
             n_points=1001,
-            fname="shd_prices_ldc.png",
+            fname="shd_prices_ldc.pdf",
             title="Shadow prices — load-duration curves over snapshots",
         )
 
@@ -6804,7 +6811,7 @@ def run_plot_operational(
         plot_utilization_ldc_by_scenario(
             n,
             items=items_f,
-            outpath=plot_folder / "CF_operation_by_scenario.png",
+            outpath=plot_folder / "CF_operation_by_scenario.pdf",
             title="Utilization LDCs (rolling horizon)",
             ncols=3,
             carrier_colors=c.carrier_colors,
@@ -6813,7 +6820,7 @@ def run_plot_operational(
         figure_heatmaps_compare_scenarios(
             n,
             items_f,
-            outpath=plot_folder / "CF_operation_heat_maps_by_scenario.png",
+            outpath=plot_folder / "CF_operation_heat_maps_by_scenario.pdf",
             title="CF patterns — rolling horizon (normalized 0–1)",
             cmap="viridis",
             abs_links=True,
@@ -6822,7 +6829,7 @@ def run_plot_operational(
         figure_heatmaps_compare_scenarios_actual(
             n,
             items_f,
-            outpath=plot_folder / "Operation_heat_maps_by_scenario.png",
+            outpath=plot_folder / "Operation_heat_maps_by_scenario.pdf",
             title="Operational heatmaps — rolling horizon (actual values)",
             cmap_pos="viridis",
             cmap_div="coolwarm",
@@ -6836,7 +6843,8 @@ def run_plot_operational(
         compute_lcop_by_technology(
             n,
             out_csv=csv_folder / "lcop_by_technology.csv",
-            out_plot=plot_folder / "lcop_by_technology.png",
+            out_plot=plot_folder / "lcop_by_technology.pdf",
+            capacity_th=c.capacity_threshold_default,
         )
 
     def step_lcop_kkt() -> None:
@@ -6849,7 +6857,7 @@ def run_plot_operational(
         compute_srmc_by_technology(
             n,
             out_csv=csv_folder / "srmc_by_technology.csv",
-            out_plot=plot_folder / "srmc_by_technology.png",
+            out_plot=plot_folder / "srmc_by_technology.pdf",
         )
 
     _safe("filter_items",       step_filter_items)
@@ -6880,9 +6888,9 @@ def run_plot_rh_comparison(
 
     Produces three outputs:
 
-    * ``PF_vs_RH_total_cost.png``  — stacked-bar total system cost (PF | RH)
+    * ``PF_vs_RH_total_cost.pdf``  — stacked-bar total system cost (PF | RH)
       broken down by carrier, reusing :func:`plot_total_system_cost_stacked`.
-    * ``PF_vs_RH_opex_delta.png``  — per-carrier OPEX difference (RH − PF).
+    * ``PF_vs_RH_opex_delta.pdf``  — per-carrier OPEX difference (RH − PF).
       Red = RH costs more, green = RH costs less.
     * ``PF_vs_RH_costs.csv``       — wide comparison table with capex/opex/total
       for both networks and the delta per carrier.
@@ -6957,7 +6965,7 @@ def run_plot_rh_comparison(
     def step_total_cost_bar() -> None:
         plot_total_system_cost_stacked(
             combined_summary,
-            outpath=str(plot_folder / "PF_vs_RH_total_cost.png"),
+            outpath=str(plot_folder / "PF_vs_RH_total_cost.pdf"),
             title="Total system cost: Perfect Foresight vs Rolling Horizon",
             which="total",
             add_expected=False,
@@ -6994,7 +7002,7 @@ def run_plot_rh_comparison(
             fontsize=10,
         )
         fig.tight_layout()
-        fig.savefig(str(plot_folder / "PF_vs_RH_opex_delta.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(str(plot_folder / "PF_vs_RH_opex_delta.pdf"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     _safe("comparison_csv",  step_comparison_csv)
