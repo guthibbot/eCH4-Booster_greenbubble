@@ -50,6 +50,35 @@ from scripts.config import (En_price_year,
 _COMMON_DIR = Path("data/common")
 _DEFAULT_PROFILE_PATH = _COMMON_DIR / "NG_demand_DK_profile.csv"
 
+# ------ HELPERS -----
+def hourly_to_15min(obj):
+    """Step-hold (forward-fill) an hourly Series/DataFrame onto a 15-min grid.
+ 
+    Every hourly value is repeated for the four quarter-hours it covers,
+    INCLUDING the last hour (resample().ffill() would stop at the last stamp
+    and lose three quarter-hours).  Works with tz-aware or tz-naive indexes.
+    Data that is already 15-min (or finer) is returned unchanged.
+    """
+    if len(obj) < 2:
+        return obj
+    step = obj.index.to_series().diff().dropna().mode().iloc[0]
+    if step <= pd.Timedelta(minutes=15):
+        return obj
+    idx = pd.date_range(obj.index.min(), obj.index.max() + step,
+                        freq="15min", inclusive="left")
+    return obj.reindex(idx, method="ffill")
+
+
+def _is_current(path, n_expected):
+    """Checks if the existing files are in the right length (15min./year)"""
+    path = Path(path)
+    if not path.exists():
+        return False
+    with open(path) as f:
+        n = sum(1 for _ in f) - 1
+    if n != n_expected:
+        print(f"[preprocess] {path} has {n} rows, expected {n_expected} — regenerating.")
+    return n == n_expected
 
 # ------ INPUTS PRE-PROCESSING ----
 
@@ -97,7 +126,7 @@ def _load_profile_ts(
     path: "str | None",
     snapshots: "pd.DatetimeIndex | None" = None,
 ) -> "pd.Series":
-    """Load a seasonal demand profile CSV and return an hourly Series.
+    """Load a seasonal demand profile CSV and return a 15min resolution Series.
 
     Parameters
     ----------
@@ -113,7 +142,7 @@ def _load_profile_ts(
     Returns
     -------
     pd.Series
-        Hourly values (daily originals divided by 24).  Index is tz-naive.
+        Quarter-hourly values (daily originals divided by 24*4).  Index is tz-naive.
     """
     src = Path(path) if path else _DEFAULT_PROFILE_PATH
     if not src.exists():
@@ -131,10 +160,10 @@ def _load_profile_ts(
     _hi = pd.date_range(
         _s.index.min(),
         _s.index.max() + pd.Timedelta(days=1),
-        freq="h",
+        freq="15min",
         inclusive="left",
     )
-    result = _s.reindex(_hi, method="ffill") / 24.0
+    result = _s.reindex(_hi, method="ffill") / (24.0 * 4)
 
     if snapshots is not None:
         opt_year = pd.DatetimeIndex(snapshots).year[0]
@@ -155,7 +184,7 @@ def build_product_demand_ts(
     store_buffer: float = 0.0,
     col_name: str = "demand MWh",
 ) -> "tuple[pandas.DataFrame, float | None]":
-    """Build an hourly demand time series and the delivery-store ``e_nom_max``.
+    """Build an 15min resolution demand time series and the delivery-store ``e_nom_max``.
 
     Parameters
     ----------
@@ -170,7 +199,7 @@ def build_product_demand_ts(
             "bins_profile" — zero except at endpoints; delivery ∝ profile_ts integral
                              within each bin.
     snapshots : pandas.DatetimeIndex
-        Network snapshot index (typically 8 760 hourly steps).
+        Network snapshot index.
     profile_ts : pandas.Series, optional
         Reference time series for ``"profile"`` and ``"bins_profile"`` modes.
         Must cover the same period as *snapshots* (reindexed + forward-filled).
@@ -261,7 +290,7 @@ def build_product_demand_ts(
 
 
 def build_demands_TS(targets_dict: dict) -> dict:
-    """Build hourly demand time series for bioCH₄, H₂ and methanol.
+    """Build 15min resolution demand time series for bioCH₄, H₂ and methanol.
 
     Demand shape (flat, profile, or periodic bins) and delivery-store sizing are
     controlled by ``targets_dict`` keys set in ``config.yaml``.  No intermediate
@@ -431,55 +460,51 @@ def download_energidata(dataset_name, start_date, end_date, sort_val=None, price
     return pd.json_normalize(records)
 
 
-def download_dk_day_ahead_prices(
-    start_date,
-    end_date,
-    price_area="DK1",
-    timeout=60,
-    resolution="1h",   # "native" or "1h"
-    how="mean",            # for 1h: "mean" (default) or "last"
-):
-    """
-    Downloads day-ahead prices across the dataset switch:
-    - Elspotprices up to 2025-09-30
-    - DayAheadPrices from 2025-10-01 onwards
-
-    Returns a single normalized DF with:
-      TimeUTC, TimeDK, PriceArea, SpotPriceEUR, SpotPriceDKK
-
-    If resolution="1h", resamples everything to hourly in UTC (DST-safe).
+def download_dk_day_ahead_prices(start_date, end_date, price_area="DK1", timeout=60):
+    """Day-ahead prices on a continuous 15-min UTC grid.
+ 
+    Datasets:
+    - Elspotprices   (hourly)  up to 2025-09-30
+    - DayAheadPrices (15 min)  from 2025-10-01
+ 
+    The hourly part is step-held to 15 min BEFORE concatenation, so a year that
+    spans the switch (2025) is handled correctly.  TimeDK is always recomputed
+    from TimeUTC (DST-safe).
+ 
+    Returns
+    -------
+    pandas.DataFrame
+        Columns TimeUTC, TimeDK, PriceArea, SpotPriceEUR, SpotPriceDKK.
+        TimeUTC and TimeDK are tz-naive.
     """
     cutoff = "2025-10-01T00:00"
-    dfs = []
-
-    # part A: old dataset (hourly)
+    cols = ["TimeUTC", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]
+    parts = []
+ 
+    # part A: old hourly dataset
     if start_date < cutoff:
-        end_a = min(end_date, cutoff)
         df_a = download_energidata(
             dataset_name="Elspotprices",
             start_date=start_date,
-            end_date=end_a,
-            sort_val="HourDK asc",
+            end_date=min(end_date, cutoff),
+            sort_val="HourUTC asc",
             price_area=price_area,
             limit=0,
             timeout=timeout,
         )
         if not df_a.empty:
-            df_a = df_a.rename(columns={
-                "HourUTC": "TimeUTC",
-                "HourDK": "TimeDK",
-                "SpotPriceEUR": "SpotPriceEUR",
-                "SpotPriceDKK": "SpotPriceDKK",
-            })
-            df_a = df_a[["TimeUTC", "TimeDK", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]]
-            dfs.append(df_a)
-
-    # part B: new dataset (15-min from Oct 2025)
+            df_a = df_a.rename(columns={"HourUTC": "TimeUTC"})[cols]
+            df_a["TimeUTC"] = pd.to_datetime(df_a["TimeUTC"])
+            df_a = (df_a.drop_duplicates("TimeUTC").sort_values("TimeUTC")
+                        .set_index("TimeUTC"))
+            df_a = hourly_to_15min(df_a).rename_axis("TimeUTC").reset_index()
+            parts.append(df_a)
+ 
+    # part B: new 15-min dataset
     if end_date > cutoff:
-        start_b = max(start_date, cutoff)
         df_b = download_energidata(
             dataset_name="DayAheadPrices",
-            start_date=start_b,
+            start_date=max(start_date, cutoff),
             end_date=end_date,
             sort_val="TimeUTC asc",
             price_area=price_area,
@@ -487,55 +512,34 @@ def download_dk_day_ahead_prices(
             timeout=timeout,
         )
         if not df_b.empty:
-            df_b = df_b.rename(columns={
-                "DayAheadPriceEUR": "SpotPriceEUR",
-                "DayAheadPriceDKK": "SpotPriceDKK",
-            })
-            df_b = df_b[["TimeUTC", "TimeDK", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]]
-            dfs.append(df_b)
+            df_b = df_b.rename(columns={"DayAheadPriceEUR": "SpotPriceEUR",
+                                        "DayAheadPriceDKK": "SpotPriceDKK"})[cols]
+            df_b["TimeUTC"] = pd.to_datetime(df_b["TimeUTC"])
+            parts.append(df_b)
+ 
+    if not parts:
+        return pd.DataFrame()
+ 
+    out = (pd.concat(parts, ignore_index=True)
+             .drop_duplicates("TimeUTC", keep="last")
+             .sort_values("TimeUTC")
+             .set_index("TimeUTC"))
+ 
+    # enforce one continuous 15-min grid; fill (and report) any gaps
+    full = pd.date_range(out.index.min(), out.index.max(), freq="15min")
+    n_missing = len(full) - len(out)
+    if n_missing:
+        print(f"[preprocess] Day-ahead prices {price_area}: forward-filling "
+              f"{n_missing} missing 15-min steps.")
+        out = out.reindex(full).ffill()
+    
+    # rebuild TimeDK in 15min. resolution
+    out = out.rename_axis("TimeUTC").reset_index()
+    out["TimeDK"] = (out["TimeUTC"].dt.tz_localize("UTC")
+                                   .dt.tz_convert("Europe/Copenhagen")
+                                   .dt.tz_localize(None))
+    return out[["TimeUTC", "TimeDK", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]]
 
-    out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    if out.empty:
-        return out
-
-    # ---- Normalize datetimes ----
-    # Parse to datetime; keep "naive" timestamps as provided by API
-    out["TimeUTC"] = pd.to_datetime(out["TimeUTC"])
-    out["TimeDK"]  = pd.to_datetime(out["TimeDK"])
-
-    # ---- Optional: resample to hourly ----
-    if resolution.lower() in ("1h", "hour", "hourly"):
-        out = out.sort_values(["PriceArea", "TimeUTC"]).set_index("TimeUTC")
-
-        if how == "last":
-            agg = "last"
-        else:
-            agg = "mean"  # default
-
-        # Resample per area
-        resampled = (
-            out.groupby("PriceArea")[["SpotPriceEUR", "SpotPriceDKK"]]
-               .resample("1h")
-               .agg(agg)
-               .reset_index()
-        )
-
-        # Recreate TimeDK from TimeUTC in a DST-safe way:
-        # interpret TimeUTC as UTC, convert to Europe/Copenhagen, then drop tz.
-        resampled["TimeDK"] = (
-            resampled["TimeUTC"]
-            .dt.tz_localize("UTC")
-            .dt.tz_convert("Europe/Copenhagen")
-            .dt.tz_localize(None)
-        )
-
-        # Keep column order
-        out = resampled[["TimeUTC", "TimeDK", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]]
-
-    else:
-        out = out[["TimeUTC", "TimeDK", "PriceArea", "SpotPriceEUR", "SpotPriceDKK"]].sort_values(["PriceArea", "TimeUTC"])
-
-    return out
 
 
 def download_ecb_exchange_rate(currency, start_date, end_date, timeout=60):
@@ -556,7 +560,7 @@ def download_gb_day_ahead_prices(year, tz="Europe/London", timeout=60):
 
     Source: Elexon BMRS Market Index Data (MID, provider APXMIDP), free and
     without API key. ENTSO-E stopped publishing GB prices after 2020. MID is
-    half-hourly and in GBP; it is averaged to hourly and converted to EUR with
+    half-hourly and in GBP; it is filled to 15min and converted to EUR with
     the daily ECB GBP/EUR rate of the local day.
 
     The window is local 1 January 00:00 to local 1 January 00:00 of the next
@@ -587,14 +591,14 @@ def download_gb_day_ahead_prices(year, tz="Europe/London", timeout=60):
     mid.loc[mid["volume"] <= 0, "price"] = np.nan  # no trades -> no price
     price_gbp = mid.set_index("startTime")["price"].sort_index()
 
-    # hourly mean on a continuous UTC axis over the local year
-    hours_utc = pd.date_range(start_utc, end_utc, freq="1h", inclusive="left")
-    price_gbp = price_gbp.resample("1h").mean().reindex(hours_utc)
+    # 15min resolution on a continuous UTC axis over the local year
+    hours_utc = pd.date_range(start_utc, end_utc, freq="15min", inclusive="left")
+    price_gbp = price_gbp.reindex(hours_utc, method="ffill",tolerance=pd.Timedelta("30min"))
     n_missing = int(price_gbp.isna().sum())
     if n_missing > 0.05 * len(price_gbp):
-        raise RuntimeError(f"Elexon MID {year}: {n_missing} of {len(price_gbp)} hours missing.")
+        raise RuntimeError(f"Elexon MID {year}: {n_missing} of {len(price_gbp)} snapshots missing.")
     if n_missing:
-        print(f"[preprocess] Elexon MID {year}: interpolating {n_missing} missing hours.")
+        print(f"[preprocess] Elexon MID {year}: interpolating {n_missing} snapshots.")
         price_gbp = price_gbp.interpolate("time").ffill().bfill()
 
     # GBP -> EUR with the ECB rate of the local day (weekends/holidays: last rate)
@@ -616,7 +620,8 @@ def download_gb_co2_intensity(year, tz="Europe/London", timeout=60):
     Source: NESO Carbon Intensity API (national, Great Britain), free and
     without API key, available from 2018. Values are half-hourly in gCO2/kWh;
     the ``actual`` value is used, the ``forecast`` where ``actual`` is missing.
-    Half-hours are averaged to hourly.
+    The half-hourly series is upsampled to 15-minute resolution by forward-filling,
+    such that each 30-minute value is retained for both constituent 15-minute intervals.
 
     The window and the index convention are the same as for
     :func:`download_gb_day_ahead_prices`.
@@ -643,9 +648,9 @@ def download_gb_co2_intensity(year, tz="Europe/London", timeout=60):
     ci = pd.DataFrame(rows, columns=["from", "gCO2_kWh"]).drop_duplicates("from")
     ci = ci.set_index(pd.to_datetime(ci["from"], utc=True))["gCO2_kWh"].astype(float).sort_index()
 
-    # hourly mean on a continuous UTC axis over the local year
-    hours_utc = pd.date_range(start_utc, end_utc, freq="1h", inclusive="left")
-    ci = ci.resample("1h").mean().reindex(hours_utc)
+    # 15min resolution on a continuous UTC axis over the local year
+    hours_utc = pd.date_range(start_utc, end_utc, freq="15min", inclusive="left")
+    ci = ci.reindex(hours_utc, method="ffill",tolerance=pd.Timedelta("30min"))
     n_missing = int(ci.isna().sum())
     if n_missing > 0.05 * len(ci):
         raise RuntimeError(f"Carbon Intensity API {year}: {n_missing} of {len(ci)} hours missing.")
@@ -659,7 +664,7 @@ def download_gb_co2_intensity(year, tz="Europe/London", timeout=60):
     return out
 
 
-
+# Timezone finder from lat,lon through timezonefinder package
 tf = TimezoneFinder()
 
 RN_MAX_DATE = pd.Timestamp("2024-12-31").date()
@@ -707,12 +712,12 @@ def retrieve_renewable_capacity_factors(
     end_local = pd.Timestamp(end_date)
 
     if start_local.tzinfo is None:
-        start_local = start_local.tz_localize(tzname)
+        start_local = start_local.tz_localize("UTC").tz_convert(tzname)
     else:
         start_local = start_local.tz_convert(tzname)
 
     if end_local.tzinfo is None:
-        end_local = end_local.tz_localize(tzname)
+        end_local = end_local.tz_localize("UTC").tz_convert(tzname)
     else:
         end_local = end_local.tz_convert(tzname)
 
@@ -770,6 +775,10 @@ def retrieve_renewable_capacity_factors(
     CF_solar.index = pd.to_datetime(CF_solar.index).tz_localize("UTC")
     CF_wind.index = pd.to_datetime(CF_wind.index).tz_localize("UTC")
 
+    # resample to from 1h to 15min
+    CF_solar = hourly_to_15min(CF_solar)
+    CF_wind = hourly_to_15min(CF_wind)
+
     # Clip in UTC using local intent converted to UTC
     start_utc = start_local.tz_convert("UTC")
     end_utc = end_local.tz_convert("UTC")
@@ -804,7 +813,7 @@ def retrieve_renewable_capacity_factors_with_fallback(
 
     Output:
 
-    - Complete hourly series on an expected UTC grid, then converted to out_timezone
+    - Complete 15min. resolution series on an expected UTC grid, then converted to out_timezone
       (default: the local time zone of the site).
     """
     tzname = tf.timezone_at(lat=latitude, lng=longitude)
@@ -830,7 +839,7 @@ def retrieve_renewable_capacity_factors_with_fallback(
     # Expected hourly UTC index for [start, end)
     start_utc = start_local.tz_convert("UTC")
     end_utc = end_local.tz_convert("UTC")
-    expected_utc = pd.date_range(start_utc, end_utc, freq="h", inclusive="left", tz="UTC")
+    expected_utc = pd.date_range(start_utc, end_utc, freq="15min", inclusive="left", tz="UTC")
 
     parts_solar, parts_wind = [], []
 
@@ -857,11 +866,11 @@ def retrieve_renewable_capacity_factors_with_fallback(
     # Determine overflow in UTC
     overflow_start_utc = max(start_utc, RN_LAST_END_EXCL_UTC)
     if end_utc > overflow_start_utc:
-        overflow_idx = pd.date_range(overflow_start_utc, end_utc, freq="h", inclusive="left", tz="UTC")
+        overflow_idx = pd.date_range(overflow_start_utc, end_utc, freq="15min", inclusive="left", tz="UTC")
         n = len(overflow_idx)
 
         mapped_end_utc = RN_LAST_END_EXCL_UTC
-        mapped_start_utc = mapped_end_utc - pd.Timedelta(hours=n)
+        mapped_start_utc = mapped_end_utc - (end_utc - overflow_start_utc)
 
         mapped_start_local = mapped_start_utc.tz_convert(tzname).strftime("%Y-%m-%d %H:%M")
         mapped_end_local = mapped_end_utc.tz_convert(tzname).strftime("%Y-%m-%d %H:%M")
@@ -901,19 +910,111 @@ def retrieve_renewable_capacity_factors_with_fallback(
 
     return CF_solar, CF_wind
 
+def retrieve_entsoe_el_demand(API_KEY, start_day, end_day, country_code):
+    """Function that retrives historical el demand with whatever resolution
+    given resolution from a specific bidding zone. CHecks if it is not 15min
+    resolution and then converts.
 
-def retrive_entsoe_el_demand(API_KEY, start_day, end_day, country_code):
-    """function that retrives historical el demand with hourly resolution from a specific bidding zone"""
-    # NOTE: list of country codes available here: https://github.com/EnergieID/entsoe-py/blob/master/entsoe/mappings.py
-
-    client = EntsoePandasClient(api_key= API_KEY)
+    Notes
+    -----
+    * list of country codes available here: https://github.com/EnergieID/entsoe-py/blob/master/entsoe/mappings.py
+    """
+    client = EntsoePandasClient(api_key=API_KEY)
 
     start = pd.Timestamp(start_day, tz='Europe/Brussels')
     end = pd.Timestamp(end_day, tz='Europe/Brussels')
 
     ts = client.query_load(country_code, start=start, end=end)
 
-    return ts
+    return hourly_to_15min(ts)
+
+
+def build_dh_profile(hours_in_period, dh_peak_capacity: float = None, path=None):
+    """Create (or convert) the district-heating demand CSV at snapshot resolution.
+ 
+    Behaviour
+    ---------
+    * File exists and has ``len(hours_in_period)`` rows -> nothing to do.
+    * File exists but is coarser (e.g. 8 760 hourly rows for a 15-min model)
+      -> upsampled to the snapshot resolution and rewritten.
+    * File missing, or its row count does not fit the snapshots -> rebuilt from
+      the 2019 DMI Skive temperature files.
+
+    Parameters
+    ----------
+    hours_in_period : pandas.DatetimeIndex
+        Model snapshot index (35 040 steps for a 15-min, non-leap year).
+    dh_peak_capacity : float, optional
+        Peak DH demand in MW; defaults to ``p.DH_Skive_Capacity``.
+    path : str or Path, optional
+        Output file; defaults to ``data/common/DH_external_demand_input.csv``.
+    """
+    path = Path(path) if path else _COMMON_DIR / "DH_external_demand_input.csv"
+    n_target = len(hours_in_period)
+    if n_target % 8760:
+        raise ValueError(
+            f"Snapshot count {n_target} is not a multiple of 8760 (non-leap year)."
+        )
+    if n_target != 8760 * 4:
+        raise ValueError("build_dh_profile expects 35 040 (15-min) snapshots.")
+    steps = 4
+ 
+    # ---- existing file: keep, upsample, or rebuild --------------------------
+    if path.exists():
+        df = pd.read_csv(path, sep=";", index_col=0)
+        n = len(df)
+        if n == n_target:
+            print(f"[preprocess] DH demand already at snapshot resolution "
+                  f"({n} rows) — skipping.")
+            return path
+        if n * 4 == n_target:
+            print(f"[preprocess] DH demand has {n} rows, expected {n_target} — upsampling x4.")
+            tmp = df.set_axis(pd.date_range("2019-01-01", periods=n, freq="h"))  # throwaway index
+            out = hourly_to_15min(tmp).set_axis(hours_in_period) # res to 15min and reindex
+            out.to_csv(path, sep=";")
+            return path
+        print(f"[preprocess] DH demand has {n} rows, expected {n_target} — "
+              f"rebuilding from DMI data.")
+ 
+    # ---- build from DMI temperature data ------------------------------------
+    # https://www.dmi.dk/friedata/observationer/
+    data_folder = p.DH_data_folder
+    frames = [
+        pd.read_csv(os.path.join(data_folder, name), sep=";",
+                    usecols=["DateTime", "Middeltemperatur"])
+        for name in sorted(os.listdir(data_folder))
+    ]
+    dh = (pd.concat(frames)
+            .drop_duplicates(subset="DateTime", keep="first")
+            .sort_values("DateTime"))
+    dh["DateTime"] = pd.to_datetime(dh["DateTime"])
+    dh["DateTime"] = pd.to_datetime(dh["DateTime"].dt.strftime("%Y-%m-%d %H:%M:%S+00:00"))
+ 
+    hours_2019 = pd.date_range("2019-01-01T00:00Z", "2020-01-01T00:00Z", freq="h")[:-1]
+    temp_h = (dh.set_index("DateTime")["Middeltemperatur"]
+                .reindex(hours_2019)
+                .interpolate("linear").ffill().bfill())
+ 
+    # Temperature expand to 15min resolution, then derive the demand
+    temp = hourly_to_15min(temp_h).to_numpy(dtype=float)
+ 
+    # source: https://ens.dk/sites/ens.dk/files/Statistik/denmarks_heat_supply_2020_eng.pdf
+    T_min, T_max = p.DH_Tamb_min, p.DH_Tamb_max
+    cf = np.clip((T_max - temp) / (T_max - T_min), 0.0, None)
+ 
+    # base load in summer (sanitary water): January mean CF / 4
+    jan_steps = 31 * 24 * steps
+    cf = cf + cf[:jan_steps].mean() / 4
+ 
+    peak = dh_peak_capacity if dh_peak_capacity is not None else p.DH_Skive_Capacity  # MW
+    out = pd.DataFrame(
+        {"Middeltemperatur": temp,
+         "Capacity Factor DH": cf,
+         "DH demand MWh": cf * peak},   # MW (power), see docstring
+        index=hours_in_period,
+    )
+    out.to_csv(path, sep=";")
+    return path
 
 
 def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None) -> None:
@@ -931,7 +1032,7 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
     ``NotImplementedError`` unless the CSV is provided by hand.
     All series cover the local calendar year of the bidding zone.
 
-    A ``"HourDK"`` sorted, leap-year-stripped hourly index is enforced on all
+    A ``"HourDK"`` sorted, leap-year-stripped 15min resolution index is enforced on all
     outputs so they align with the model snapshot index from
     :func:`scripts.helpers.build_snapshots`.
 
@@ -971,6 +1072,7 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
     from scripts.helpers import build_snapshots, is_eu_or_us
     _year = int(year) if year is not None else En_price_year
     hours_in_period, _, _ = build_snapshots(_year)
+    n_expected = len(hours_in_period)
     _zone = p.market_zone(_year)  # can change between years (e.g. Italy 2021)
     _folder = p.input_data_folder(_year, _zone)
     os.makedirs(_folder, exist_ok=True)
@@ -987,22 +1089,21 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
     end_date = (dates[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
 
     '''El spot prices - EUR/MWh, local time of the bidding zone'''
-    if not Path(El_price_input_file).exists() and _zone == 'GB':
+    if not _is_current(El_price_input_file, n_expected) and _zone == 'GB':
         Elspotprices = download_gb_day_ahead_prices(_year)
         Elspotprices = remove_feb_29(Elspotprices)
         Elspotprices.to_csv(El_price_input_file, sep=';')  # EUR/MWh
-    elif not Path(El_price_input_file).exists():
+    elif not _is_current(El_price_input_file, n_expected):
         if _zone not in ('DK_1', 'DK_2'):
             raise NotImplementedError(
                 f"No electricity price source for bidding zone {_zone!r}. "
                 f"Available: DK_1, DK_2 (Energi Data Service) and GB (Elexon).")
         Elspotprices_data = download_dk_day_ahead_prices(
-            start_date=start_date,
-            end_date=end_date,
-            price_area=_zone.replace('_', ''),
-            timeout=60,
-            resolution="1h",  # "native" or "1h"
-            how="mean")
+                start_date=start_date,
+                end_date=end_date,
+                price_area=_zone.replace('_', ''),
+                timeout=60)
+
 
         #Elspotprices_data = download_energidata(dataset_name, p.start_date, p.end_date, sort_val, p.filter_area)
         Elspotprices = Elspotprices_data[['TimeDK', 'SpotPrice' + 'EUR']].copy()
@@ -1017,11 +1118,11 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
 
     '''CO2 emission from El Grid (Energi Data Service for DK1/DK2, NESO for GB)'''
     # DeclarationEmissionHour was removed from the API; DeclarationGridEmission covers all years
-    if not Path(CO2emis_input_file).exists() and _zone == 'GB':
+    if not _is_current(CO2emis_input_file, n_expected) and _zone == 'GB':
         CO2_emiss_El = download_gb_co2_intensity(_year)
         CO2_emiss_El = remove_feb_29(CO2_emiss_El)
         CO2_emiss_El.to_csv(CO2emis_input_file, sep=';')  # t/MWh
-    elif not Path(CO2emis_input_file).exists():
+    elif not _is_current(CO2emis_input_file, n_expected):
         if _zone not in ('DK_1', 'DK_2'):
             raise NotImplementedError(
                 f"No grid CO2 intensity source for bidding zone {_zone!r} (DK_1, DK_2, GB). "
@@ -1046,8 +1147,8 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
         co = (co.sort_values('HourUTC')
                 .drop_duplicates('HourUTC', keep='first')
                 .set_index('HourUTC')['CO2PerkWh'])
-        co = co.resample('1h').mean().interpolate('time').ffill().bfill()
-        co = co / 1000.0  # t/MWh
+        co = co.resample('1h').mean().interpolate('time').ffill().bfill()  # fill hourly gaps
+        co = hourly_to_15min(co) / 1000.0                                 # 15 min, t/MWh
         # DST-safe local time, identical convention to download_dk_day_ahead_prices
         tdk = (co.index.tz_localize('UTC')
                        .tz_convert('Europe/Copenhagen')
@@ -1061,7 +1162,7 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
 
     # NG prices depending on the year
     ''' NG prices prices in DKK/kWh or EUR/kWH'''
-    if not Path(NG_price_year_input_file).exists():
+    if not _is_current(NG_price_year_input_file, n_expected):
         if _zone not in ('DK_1', 'DK_2'):
             print(f"[preprocess] WARNING: NG prices are the Danish / THE hub series; "
                   f"used as a proxy for bidding zone {_zone}.")
@@ -1090,7 +1191,7 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
                 {'HourDK': hours_in_period[-1:len(hours_in_period)], NG_price_col_name: NG_price_year.iloc[-1, 0]})
             last_rows3.set_index('HourDK', inplace=True)
             NG_price_year = pd.concat([NG_price_year, last_rows3])
-            NG_price_year = NG_price_year.asfreq('h', method='ffill')
+            NG_price_year = NG_price_year.asfreq('15min', method='ffill')
 
         elif _year > 2022:
             # due to different structure of Energinet dataset for the year 2019 and 2022
@@ -1125,7 +1226,7 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
             THE_daily_NG_prices = THE_daily_NG_prices.set_index("HourDK").sort_index()
             THE_daily_NG_prices.index = THE_daily_NG_prices.index.tz_localize(None)
 
-            # --- Reindex to your full hourly index and forward fill
+            # --- Reindex to your full 15min index and forward fill
             hours = pd.DatetimeIndex(hours_in_period)  # ensures it's a DatetimeIndex
             THE_daily_NG_prices = THE_daily_NG_prices.reindex(hours).ffill()
 
@@ -1170,46 +1271,11 @@ def pre_processing_energy_data(year: int = None, dh_peak_capacity: float = None)
     # Profile is derived from fixed 2019 Skive weather data — year-agnostic.
     # Skip if already present in data/common/ to avoid re-reading local DMI files
     # on non-EU (e.g. California) machines where p.DH_data_folder may be absent.
-    if not Path(DH_external_demand_input_file).exists():
-        # https://www.dmi.dk/friedata/observationer/
-        data_folder = p.DH_data_folder
-        name_files = os.listdir(data_folder)
-        DH_Skive = pd.DataFrame()
-
-        for name in name_files:
-            df_temp_2 = pd.read_csv(os.path.join(data_folder, name), sep=';', usecols=['DateTime', 'Middeltemperatur'])
-            DH_Skive = pd.concat([DH_Skive, df_temp_2])
-
-        DH_Skive = DH_Skive.drop_duplicates(subset='DateTime', keep='first')
-        DH_Skive = DH_Skive.sort_values(by=['DateTime'], ascending=True)
-        DH_Skive['DateTime'] = pd.to_datetime(DH_Skive['DateTime'])
-        DH_Skive['DateTime'] = pd.to_datetime(DH_Skive['DateTime'].dt.strftime("%Y-%m-%d %H:%M:%S+00:00"))
-        hours_in_2019 = pd.date_range('2019-01-01T00:00' + 'Z', '2020-01-01T00:00' + 'Z', freq='h')
-        hours_in_2019 = hours_in_2019.drop(hours_in_2019[-1])
-        DH_Skive = DH_Skive.set_index("DateTime").reindex(hours_in_2019)
-
-        DH_max_capacity = dh_peak_capacity if dh_peak_capacity is not None else p.DH_Skive_Capacity  # MW
-        # source: https://ens.dk/sites/ens.dk/files/Statistik/denmarks_heat_supply_2020_eng.pdf
-        DH_Tamb_min = p.DH_Tamb_min  # minimum outdoor temp --> maximum Capacity Factor
-        DH_Tamb_max = p.DH_Tamb_max  # maximum outdoor temp--> capacity Factor = 0
-        CF_DH = (DH_Tamb_max - DH_Skive['Middeltemperatur'].values) / (DH_Tamb_max - DH_Tamb_min)
-        CF_DH[CF_DH < 0] = 0
-        DH_Skive['Capacity Factor DH'] = CF_DH
-        # adjust for base load in summer months due to sanitary water
-        # assumption: mean heat load in January/July = 6 (from Aarhus data).
-        DH_CFmean_Jan = np.mean(DH_Skive.loc['2019-01', 'Capacity Factor DH'])
-        DH_CFbase_load = DH_CFmean_Jan / 4
-        DH_Skive['Capacity Factor DH'] = DH_Skive['Capacity Factor DH'] + DH_CFbase_load
-        DH_Skive['DH demand MWh'] = DH_Skive[
-                                        'Capacity Factor DH'] * DH_max_capacity
-        DH_Skive = remove_feb_29(DH_Skive)
-        DH_Skive = DH_Skive.set_axis(hours_in_period)
-        DH_Skive = DH_Skive.interpolate(method='linear')
-        DH_Skive.to_csv(DH_external_demand_input_file, sep=';')  # MWh/h
-
+    build_dh_profile(hours_in_period, dh_peak_capacity)
+    
     '''Onshore Wind and Solar Capacity Factors'''
     # Download CF for wind and solar corresponding to the energy year
-    if not (Path(CF_wind_input_file).exists() and Path(CF_solar_input_file).exists()):
+    if not (_is_current(CF_wind_input_file, n_expected) and _is_current(CF_solar_input_file, n_expected)):
         if not p.RN_token:
             raise RuntimeError(
                 f"CF_wind.csv / CF_solar.csv are missing for year {_year} and RN_TOKEN is not set.\n"
@@ -1269,12 +1335,12 @@ def prepare_all_inputs(targets_dict: dict, CO2_cost: float,
 
         * ``"GL_inputs"`` — GreenLab energy/material flow table
         * ``"GL_eff"`` — bus-to-bus efficiency DataFrame
-        * ``"Elspotprices"`` — hourly electricity spot prices (EUR/MWh)
-        * ``"CO2_emiss_El"`` — hourly CO₂ emission intensity (kg/MWh)
-        * ``"CF_wind"`` — hourly wind capacity factors
-        * ``"CF_solar"`` — hourly solar capacity factors
-        * ``"NG_price_year"`` — hourly natural gas price (EUR/MWh)
-        * ``"DH_external_demand"`` — hourly district-heating demand (MWh)
+        * ``"Elspotprices"`` — 15min resolution electricity spot prices (EUR/MWh)
+        * ``"CO2_emiss_El"`` — 15min resolution CO₂ emission intensity (kg/MWh)
+        * ``"CF_wind"`` — 15min resolution wind capacity factors
+        * ``"CF_solar"`` — 15min resolution solar capacity factors
+        * ``"NG_price_year"`` — 15min resolution natural gas price (EUR/MWh)
+        * ``"DH_external_demand"`` — 15min resolution district-heating demand (MWh)
         * ``"demands"`` — sub-dict with H₂, bioCH₄ and MeOH demand series
         * ``"CO2_cost"`` — CO₂ price scalar (EUR/t)
         * ``"max_RE_to_grid"`` — grid export fraction scalar
@@ -1335,3 +1401,7 @@ def prepare_all_inputs(targets_dict: dict, CO2_cost: float,
 
     return inputs_dict
 
+if __name__ == "__main__":
+    print("Starting preprocessing...")
+    pre_processing_energy_data()
+    print("Finished preprocessing.")

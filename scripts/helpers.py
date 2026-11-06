@@ -129,7 +129,7 @@ def build_snapshots(year: int):
     end   = f"{year+1}-01-01 00:00"
 
     # tz-naive hourly index; end is excluded
-    hours = pd.date_range(start, end, freq="h", inclusive="left")
+    hours = pd.date_range(start, end, freq="15min", inclusive="left")
 
     # optional: drop Feb 29 if your inputs don't have it
     if calendar.isleap(year):
